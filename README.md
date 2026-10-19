@@ -45,18 +45,30 @@ uv sync
 uv run pytest -q
 ```
 
-The notebook also runs locally: set `DRY_RUN = True` to use a randomly initialised 4-layer Qwen3.5 with
-the real tokenizer and small data. It exercises every cell in about 20 s.
+The stage-0 pipeline lives in `extraction/stage0.py`; `uv run python scripts/run_stage0.py --dry-run`
+runs it on CPU with a randomly initialised 4-layer Qwen3.5, the real tokenizer and small data (~20 s).
+The notebook calls the same code (`DRY_RUN = True` for the same smoke test).
 
 ## Stage 0 on Colab
 
-1. Open `notebooks/stage0_probe_colab.ipynb` from `github.com/pherber3/extraction-model` in Colab
-   (File → Open notebook → GitHub); the setup cell clones the repo.
-2. Choose an A100 runtime, Run all. The setup cell installs `transformers>=5.20`, `datasets` and
-   `flash-linear-attention` with pip (Colab is not a uv environment).
-3. Results land in `/content/stage0_results` (a per-layer table, the best layer's per-field rows, the
-   train log and the probe weights) and are downloaded as a zip; the weights (~1 GB) are only included
-   with `INCLUDE_HEADS = True`.
+**From the terminal (Colab CLI).** The CLI is Linux/macOS-only and needs Python ≥3.13, so on Windows
+it runs through `scripts/colab.py` in its own uvx environment (it stubs the Unix-only console module and
+defaults to `--auth=adc`):
+
+```sh
+# once: gcloud auth application-default login --scopes="openid,https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/userinfo.email,https://www.googleapis.com/auth/colaboratory"
+alias colab='uvx --python 3.13 --from google-colab-cli python scripts/colab.py'
+colab new -s stage0 --gpu A100                    # billable from here
+colab upload -s stage0 results/code.zip /content/code.zip   # zip of the working tree
+# then `colab exec` a launcher that unzips, pip-installs transformers>=5.20 datasets
+# flash-linear-attention, and starts scripts/run_stage0.py in the background with output to a log;
+# `colab exec` again to read the log; `colab download` the results; `colab stop -s stage0`.
+```
+
+**From the browser.** Open `notebooks/stage0_probe_colab.ipynb` from `github.com/pherber3/extraction-model`
+(File → Open notebook → GitHub), choose an A100 runtime, Run all. The setup cell clones the repo and
+pip-installs the same packages. Results go to `/content/stage0_results` and download as a zip; the probe
+weights (~1 GB) are only included with `INCLUDE_HEADS = True`.
 
 What it measures: for each of the 32 layers, span accuracy and null detection on four held-out suites:
 synthetic documents from templates never seen in training, SQuAD 2.0 dev, Gretel test and FDA.

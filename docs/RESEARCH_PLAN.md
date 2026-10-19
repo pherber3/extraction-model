@@ -92,10 +92,12 @@ quantiles`), so one scorer handles both models.
 
 ## Infrastructure
 
-- Training/eval on a Colab A100 80 GB; repo `github.com/pherber3/extraction-model` (public) cloned in the
-  notebook. Colab installs `transformers>=5.20`, `datasets`, `flash-linear-attention` with pip.
-- Local: uv project (`uv add`, never `uv pip install`), CPU torch; `DRY_RUN=True` runs the notebook on a
-  random 4-layer Qwen3.5 in ~20 s.
+- Training/eval on Colab A100 80 GB (~6.8 compute units/hour). Preferred: the Colab CLI from this machine
+  via `scripts/colab.py` (Windows shim, uvx Python 3.13, `--auth=adc`), uploading a zip of the local working
+  tree, so runs do not need a push. Browser fallback: the notebook clones `github.com/pherber3/extraction-model`.
+- Never push to GitHub, and never create or stop a billable Colab session, without the user's go-ahead.
+- Local: uv project (`uv add`, never `uv pip install`), CPU torch; `scripts/run_stage0.py --dry-run` runs the
+  pipeline on a random 4-layer Qwen3.5 in ~20 s.
 
 ## Risks
 
