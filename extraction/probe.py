@@ -16,7 +16,7 @@ from typing import Any, Iterator
 import torch
 
 from .encode import SPAN_TYPES, EncodedRecord, encode_example, token_span_to_chars
-from .heads import SpanNullHead, decode_span, field_loss
+from .heads import FieldBatch, SpanNullHead, batch_loss, decode_spans
 from .normalize import normalize_value
 
 
@@ -37,6 +37,7 @@ def load_backbone(model_id: str, device: str = "cuda", dtype: torch.dtype = torc
     """Load a Qwen3.5 checkpoint and keep only its text model, frozen."""
     from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 
+    torch.set_float32_matmul_precision("high")  # TF32 for the fp32 probe heads (A100 tensor cores)
     full = Qwen3_5ForConditionalGeneration.from_pretrained(model_id, dtype=dtype, device_map={"": device})
     text_model = full.model.language_model
     full.model.visual = None  # stage 0 is text-only; free the vision tower
@@ -82,13 +83,23 @@ def token_batches(records: list[EncodedRecord], max_tokens: int) -> Iterator[lis
         yield batch
 
 
-@torch.no_grad()
-def layer_states(backbone: Backbone, records: list[EncodedRecord], layers: list[int]) -> dict[int, torch.Tensor]:
-    """Hidden states after each requested layer (1-based; ``num_layers`` is the final, normed output)."""
-    pad = backbone.tokenizer.pad_token_id or 0
+def padded_length(records: list[EncodedRecord], multiple: int = 128) -> int:
+    """Longest record rounded up, so kernels that specialize on sequence length see few distinct shapes."""
     longest = max(len(record.input_ids) for record in records)
-    input_ids = torch.full((len(records), longest), pad, dtype=torch.long)
-    attention_mask = torch.zeros((len(records), longest), dtype=torch.long)
+    return -(-longest // multiple) * multiple
+
+
+@torch.no_grad()
+def layer_states(
+    backbone: Backbone, records: list[EncodedRecord], layers: list[int], seq_len: int
+) -> dict[int, torch.Tensor]:
+    """Hidden states after each requested layer (1-based; ``num_layers`` is the final, normed output).
+
+    Rows are right-padded to ``seq_len``; the model is causal, so padding never affects real tokens.
+    """
+    pad = backbone.tokenizer.pad_token_id or 0
+    input_ids = torch.full((len(records), seq_len), pad, dtype=torch.long)
+    attention_mask = torch.zeros((len(records), seq_len), dtype=torch.long)
     for row, record in enumerate(records):
         input_ids[row, : len(record.input_ids)] = torch.tensor(record.input_ids)
         attention_mask[row, : len(record.input_ids)] = 1
@@ -134,17 +145,14 @@ def train_probes(backbone: Backbone, examples: list[dict[str, Any]], config: Pro
         batches = list(token_batches(records, config.max_tokens))
         rng.shuffle(batches)
         for batch in batches:
-            states = layer_states(backbone, batch, config.layers)
-            losses = {}
-            for layer, head in heads.items():
-                terms = [
-                    loss
-                    for record, field_logits in zip(batch, head(states[layer], batch))
-                    for encoded, logits in zip(record.fields, field_logits)
-                    if (loss := field_loss(logits, encoded.kind, encoded.start_token, encoded.end_token)) is not None
-                ]
-                if terms:
-                    losses[layer] = torch.stack(terms).mean()
+            seq_len = padded_length(batch)
+            states = layer_states(backbone, batch, config.layers, seq_len)
+            fields = FieldBatch.build(batch, seq_len, backbone.device)
+            losses = {
+                layer: loss
+                for layer, head in heads.items()
+                if (loss := batch_loss(head(states[layer], fields), fields)) is not None
+            }
             if not losses:
                 continue
             optimizer.zero_grad(set_to_none=True)
@@ -155,7 +163,7 @@ def train_probes(backbone: Backbone, examples: list[dict[str, Any]], config: Pro
                 values = {layer: loss.item() for layer, loss in losses.items()}
                 log.append({"epoch": epoch, "step": step, **{f"loss_L{layer}": v for layer, v in values.items()}})
                 best = min(values, key=values.__getitem__)
-                print(f"epoch {epoch} step {step}: best layer {best} loss {values[best]:.4f}", flush=True)
+                print(f"epoch {epoch} step {step}/{config.epochs * len(batches)}: best layer {best} loss {values[best]:.4f}", flush=True)
     return ProbeResult(heads, log)
 
 
@@ -180,31 +188,36 @@ def predict(
     """
     by_id = {str(ex["id"]): ex for ex in examples}
     records = [encode_example(backbone.tokenizer, ex, config.max_length) for ex in examples]
-    output: dict[int, dict[str, dict[str, dict[str, Any]]]] = {layer: {} for layer in heads}
+    predictions: dict[int, dict[str, dict[str, dict[str, Any]]]] = {layer: {} for layer in heads}
     for batch in token_batches(records, config.max_tokens):
-        states = layer_states(backbone, batch, list(heads))
+        seq_len = padded_length(batch)
+        states = layer_states(backbone, batch, list(heads), seq_len)
+        fields = FieldBatch.build(batch, seq_len, backbone.device)
+        owners = [(record, encoded) for record in batch for encoded in record.fields]
         for layer, head in heads.items():
-            for record, field_logits in zip(batch, head.eval()(states[layer], batch)):
+            output = head.eval()(states[layer], fields)
+            start, end, p_span = decode_spans(output, config.max_span_tokens)
+            relative_start = (start - fields.state_start).tolist()
+            relative_end = (end - fields.state_start).tolist()
+            p_span, p_null = p_span.tolist(), torch.sigmoid(output.null).tolist()
+            for f, (record, encoded) in enumerate(owners):
+                if encoded.type not in SPAN_TYPES or not record.state_offsets:
+                    continue
                 example = by_id[record.record_id]
                 state = example["request"]["state"]
-                answers = output[layer].setdefault(record.record_id, {})
-                for encoded, logits in zip(record.fields, field_logits):
-                    if encoded.type not in SPAN_TYPES or not record.state_offsets:
-                        continue
-                    spec = example["request"]["fields"][encoded.name]
-                    start, end, p_span = decode_span(logits, config.max_span_tokens)
-                    char_start, char_end = token_span_to_chars(state, record.state_offsets, start, end)
-                    guess = _typed_value(encoded.type, state[char_start:char_end], spec, example["request"].get("reference_date"))
-                    p_null = float(torch.sigmoid(logits.null))
-                    answers[encoded.name] = {
-                        "type": encoded.type,
-                        "p_null": p_null,
-                        "span": [char_start, char_end],
-                        "guess": guess,
-                        "confidence": p_span,
-                        "value": None if p_null > 0.5 else guess,
-                    }
-    return output
+                spec = example["request"]["fields"][encoded.name]
+                char_start, char_end = token_span_to_chars(state, record.state_offsets, relative_start[f], relative_end[f])
+                guess = _typed_value(encoded.type, state[char_start:char_end], spec, example["request"].get("reference_date"))
+                answers = predictions[layer].setdefault(record.record_id, {})
+                answers[encoded.name] = {
+                    "type": encoded.type,
+                    "p_null": p_null[f],
+                    "span": [char_start, char_end],
+                    "guess": guess,
+                    "confidence": p_span[f],
+                    "value": None if p_null[f] > 0.5 else guess,
+                }
+    return predictions
 
 
 def save_heads(result: ProbeResult, directory: str | Path) -> None:
