@@ -1,23 +1,33 @@
-"""Stage-0 probe: which backbone layer makes span extraction and null detection readable?
+"""Training and prediction for heads on a frozen backbone (stages 0 and 1).
 
-The backbone is frozen. One ``SpanNullHead`` per probed layer is trained on the same batches
-(one backbone forward per batch feeds every head), then each head predicts on held-out examples
-in Clairic's answer format so the same scorer handles our model and Clairic.
+One backbone forward per batch feeds every head being trained, so several heads (e.g. one probe per
+layer in stage 0) cost one backbone pass. A head exposes ``layers`` (the hidden states it reads),
+``loss(states, fields)`` and ``decode(states, fields, max_span_tokens)``; see ``extraction.heads``.
+Predictions come out in Clairic's answer format so the same scorer handles our model and Clairic.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Protocol
 
 import torch
 
 from .encode import SPAN_TYPES, EncodedRecord, encode_example, token_span_to_chars
-from .heads import FieldBatch, SpanNullHead, batch_loss, decode_spans
+from .heads import FieldBatch, Prediction
 from .normalize import normalize_value
+
+
+class Head(Protocol):
+    layers: tuple[int, ...]
+
+    def loss(self, states: dict[int, torch.Tensor], fields: FieldBatch) -> torch.Tensor | None: ...
+
+    def decode(self, states: dict[int, torch.Tensor], fields: FieldBatch, max_span_tokens: int) -> Prediction: ...
 
 
 @dataclass
@@ -37,10 +47,10 @@ def load_backbone(model_id: str, device: str = "cuda", dtype: torch.dtype = torc
     """Load a Qwen3.5 checkpoint and keep only its text model, frozen."""
     from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 
-    torch.set_float32_matmul_precision("high")  # TF32 for the fp32 probe heads (A100 tensor cores)
+    torch.set_float32_matmul_precision("high")  # TF32 for the fp32 heads (A100 tensor cores)
     full = Qwen3_5ForConditionalGeneration.from_pretrained(model_id, dtype=dtype, device_map={"": device})
     text_model = full.model.language_model
-    full.model.visual = None  # stage 0 is text-only; free the vision tower
+    full.model.visual = None  # text-only for now; free the vision tower
     text_model.requires_grad_(False).eval()
     config = text_model.config
     return Backbone(text_model, AutoTokenizer.from_pretrained(model_id), config.hidden_size, list(config.layer_types), torch.device(device))
@@ -59,6 +69,20 @@ def tiny_backbone(tokenizer_id: str = "Qwen/Qwen3.5-4B", seed: int = 0) -> Backb
     )
     model = Qwen3_5TextModel(config).requires_grad_(False).eval()
     return Backbone(model, tokenizer, config.hidden_size, list(config.layer_types), torch.device("cpu"))
+
+
+def truncate_backbone(backbone: Backbone, deepest_layer: int) -> None:
+    """Drop the decoder layers after ``deepest_layer + 1`` to save compute.
+
+    One extra layer is kept because the model's last hidden state is the final-normed output; with
+    ``deepest_layer + 1`` layers, ``hidden_states[1..deepest_layer]`` are the same raw residual states as
+    in the full model (causal model, no later layer feeds back).
+    """
+    keep = min(deepest_layer + 1, backbone.num_layers)
+    backbone.model.layers = torch.nn.ModuleList(list(backbone.model.layers)[:keep])
+    backbone.model.config.num_hidden_layers = keep
+    backbone.model.config.layer_types = backbone.layer_types[:keep]
+    backbone.layer_types = backbone.layer_types[:keep]
 
 
 def shuffled_fields(example: dict[str, Any], rng: random.Random) -> dict[str, Any]:
@@ -113,13 +137,13 @@ def layer_states(
 
 
 @dataclass
-class ProbeConfig:
-    layers: list[int]
-    head_width: int = 512
-    epochs: int = 3
+class TrainConfig:
+    epochs: int = 2
     lr: float = 3e-4
     weight_decay: float = 0.01
-    max_tokens: int = 16384
+    schedule: str = "constant"  # or "cosine": linear warmup then cosine decay to 0
+    warmup_fraction: float = 0.05
+    max_tokens: int = 8192
     max_length: int = 8192
     max_span_tokens: int = 48
     seed: int = 0
@@ -127,17 +151,37 @@ class ProbeConfig:
 
 
 @dataclass
-class ProbeResult:
-    heads: dict[int, SpanNullHead]
+class TrainResult:
+    heads: dict[str, torch.nn.Module]
     train_log: list[dict[str, float]] = field(default_factory=list)
 
 
-def train_probes(backbone: Backbone, examples: list[dict[str, Any]], config: ProbeConfig) -> ProbeResult:
+def _needed_layers(heads: dict[str, Any]) -> list[int]:
+    return sorted({layer for head in heads.values() for layer in head.layers})
+
+
+def train_heads(
+    backbone: Backbone, heads: dict[str, torch.nn.Module], examples: list[dict[str, Any]], config: TrainConfig
+) -> TrainResult:
     rng = random.Random(config.seed)
-    torch.manual_seed(config.seed)
-    heads = {layer: SpanNullHead(backbone.hidden_size, config.head_width).to(backbone.device) for layer in config.layers}
+    layers = _needed_layers(heads)
     parameters = [p for head in heads.values() for p in head.parameters()]
     optimizer = torch.optim.AdamW(parameters, lr=config.lr, weight_decay=config.weight_decay)
+    # The step count is fixed by the data, so the schedule can be laid out before training.
+    probe_records = [encode_example(backbone.tokenizer, ex, config.max_length) for ex in examples]
+    total_steps = config.epochs * sum(1 for _ in token_batches(probe_records, config.max_tokens))
+    warmup = max(1, int(config.warmup_fraction * total_steps))
+
+    def lr_factor(step: int) -> float:
+        if config.schedule == "constant":
+            return 1.0
+        if step < warmup:
+            return (step + 1) / warmup
+        return 0.5 * (1 + math.cos(math.pi * (step - warmup) / max(1, total_steps - warmup)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+    for head in heads.values():
+        head.train()
     log: list[dict[str, float]] = []
     step = 0
     for epoch in range(config.epochs):
@@ -146,25 +190,22 @@ def train_probes(backbone: Backbone, examples: list[dict[str, Any]], config: Pro
         rng.shuffle(batches)
         for batch in batches:
             seq_len = padded_length(batch)
-            states = layer_states(backbone, batch, config.layers, seq_len)
+            states = layer_states(backbone, batch, layers, seq_len)
             fields = FieldBatch.build(batch, seq_len, backbone.device)
-            losses = {
-                layer: loss
-                for layer, head in heads.items()
-                if (loss := batch_loss(head(states[layer], fields), fields)) is not None
-            }
+            losses = {name: loss for name, head in heads.items() if (loss := head.loss(states, fields)) is not None}
             if not losses:
                 continue
             optimizer.zero_grad(set_to_none=True)
             torch.stack(list(losses.values())).sum().backward()
             optimizer.step()
+            scheduler.step()
             step += 1
             if step % config.log_every == 0:
-                values = {layer: loss.item() for layer, loss in losses.items()}
-                log.append({"epoch": epoch, "step": step, **{f"loss_L{layer}": v for layer, v in values.items()}})
+                values = {name: loss.item() for name, loss in losses.items()}
+                log.append({"epoch": epoch, "step": step, **{f"loss_{name}": v for name, v in values.items()}})
                 best = min(values, key=values.__getitem__)
-                print(f"epoch {epoch} step {step}/{config.epochs * len(batches)}: best layer {best} loss {values[best]:.4f}", flush=True)
-    return ProbeResult(heads, log)
+                print(f"epoch {epoch} step {step}/{total_steps}: best {best} loss {values[best]:.4f}", flush=True)
+    return TrainResult(heads, log)
 
 
 def _typed_value(type_: str, raw: str, spec: dict[str, Any], reference_date: str | None) -> Any:
@@ -177,29 +218,31 @@ def _typed_value(type_: str, raw: str, spec: dict[str, Any], reference_date: str
 @torch.no_grad()
 def predict(
     backbone: Backbone,
-    heads: dict[int, SpanNullHead],
+    heads: dict[str, torch.nn.Module],
     examples: list[dict[str, Any]],
-    config: ProbeConfig,
-) -> dict[int, dict[str, dict[str, dict[str, Any]]]]:
-    """Per layer: ``{example_id: {field: answer}}`` in Clairic's answer format.
+    config: TrainConfig,
+) -> dict[str, dict[str, dict[str, dict[str, Any]]]]:
+    """Per head: ``{example_id: {field: answer}}`` in Clairic's answer format.
 
     Only single-span field types are answered; others (list, estimate, forecast) are omitted, so
     the scorer counts them as unanswered rather than as wrong guesses.
     """
     by_id = {str(ex["id"]): ex for ex in examples}
     records = [encode_example(backbone.tokenizer, ex, config.max_length) for ex in examples]
-    predictions: dict[int, dict[str, dict[str, dict[str, Any]]]] = {layer: {} for layer in heads}
+    layers = _needed_layers(heads)
+    for head in heads.values():
+        head.eval()
+    predictions: dict[str, dict[str, dict[str, dict[str, Any]]]] = {name: {} for name in heads}
     for batch in token_batches(records, config.max_tokens):
         seq_len = padded_length(batch)
-        states = layer_states(backbone, batch, list(heads), seq_len)
+        states = layer_states(backbone, batch, layers, seq_len)
         fields = FieldBatch.build(batch, seq_len, backbone.device)
         owners = [(record, encoded) for record in batch for encoded in record.fields]
-        for layer, head in heads.items():
-            output = head.eval()(states[layer], fields)
-            start, end, p_span = decode_spans(output, config.max_span_tokens)
-            relative_start = (start - fields.state_start).tolist()
-            relative_end = (end - fields.state_start).tolist()
-            p_span, p_null = p_span.tolist(), torch.sigmoid(output.null).tolist()
+        for name, head in heads.items():
+            decoded = head.decode(states, fields, config.max_span_tokens)
+            relative_start = (decoded.start - fields.state_start).tolist()
+            relative_end = (decoded.end - fields.state_start).tolist()
+            p_span, p_null = decoded.p_span.tolist(), decoded.p_null.tolist()
             for f, (record, encoded) in enumerate(owners):
                 if encoded.type not in SPAN_TYPES or not record.state_offsets:
                     continue
@@ -208,8 +251,7 @@ def predict(
                 spec = example["request"]["fields"][encoded.name]
                 char_start, char_end = token_span_to_chars(state, record.state_offsets, relative_start[f], relative_end[f])
                 guess = _typed_value(encoded.type, state[char_start:char_end], spec, example["request"].get("reference_date"))
-                answers = predictions[layer].setdefault(record.record_id, {})
-                answers[encoded.name] = {
+                predictions[name].setdefault(record.record_id, {})[encoded.name] = {
                     "type": encoded.type,
                     "p_null": p_null[f],
                     "span": [char_start, char_end],
@@ -220,9 +262,9 @@ def predict(
     return predictions
 
 
-def save_heads(result: ProbeResult, directory: str | Path) -> None:
+def save_heads(result: TrainResult, directory: str | Path) -> None:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    for layer, head in result.heads.items():
-        torch.save(head.state_dict(), directory / f"head_L{layer}.pt")
+    for name, head in result.heads.items():
+        torch.save(head.state_dict(), directory / f"head_{name}.pt")
     (directory / "train_log.json").write_text(json.dumps(result.train_log))

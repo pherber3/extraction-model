@@ -16,8 +16,9 @@ read the backbone's hidden states and return Clairic-shaped answers (`value`, `s
 | Path | Contents |
 |---|---|
 | `extraction/encode.py` | Request → token sequence; char↔token span mapping |
-| `extraction/heads.py` | Span pointer + null head on one layer; span decoding |
-| `extraction/probe.py` | Stage 0: frozen backbone, one probe per layer, predictions in Clairic format |
+| `extraction/heads.py` | Stage-0 span+null probe; stage-1 extraction head (layer mix, field mixer, start-conditioned end) |
+| `extraction/train.py` | Frozen backbone: load/truncate, train any heads from one forward per batch, predict in Clairic format |
+| `extraction/stage0.py`, `extraction/stage1.py` | Stage pipelines (data, training, per-suite evaluation, outputs) |
 | `extraction/synth.py`, `extraction/normalize.py` | Synthetic invoices / receipts / support emails / shipping notices with exact spans, null decoys and computed fields; the shared value normalizer |
 | `extraction/public_data.py` | SQuAD 2.0, Gretel synthetic finance (train/eval) and FDA (eval) converted to the same format |
 | `extraction/scoring.py` | Exact match (null counts as an answer), matched-coverage accuracy, Brier/ECE, CRPS, interval score, McNemar, document-clustered bootstrap |
@@ -45,9 +46,11 @@ uv sync
 uv run pytest -q
 ```
 
-The stage-0 pipeline lives in `extraction/stage0.py`; `uv run python scripts/run_stage0.py --dry-run`
-runs it on CPU with a randomly initialised 4-layer Qwen3.5, the real tokenizer and small data (~20 s).
-The notebook calls the same code (`DRY_RUN = True` for the same smoke test).
+The stage pipelines live in `extraction/stage0.py` (one probe per layer) and `extraction/stage1.py` (the
+stage-1 extraction head trained next to the stage-0 probe); `extraction/train.py` trains any heads on a
+frozen backbone. `uv run python scripts/run_stage0.py --dry-run` (or `run_stage1.py --dry-run`) runs a
+pipeline on CPU with a randomly initialised 4-layer Qwen3.5, the real tokenizer and small data (~20 s).
+The notebook calls the stage-0 code (`DRY_RUN = True` for the same smoke test).
 
 ## Stage 0 on Colab
 

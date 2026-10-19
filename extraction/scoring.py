@@ -10,6 +10,8 @@ gold field = {"value", "kind", "span", "spans"}; prediction field = Clairic
 from __future__ import annotations
 
 import math
+import re
+import string
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
@@ -362,6 +364,26 @@ def _distributional_metrics(pred: Mapping[str, Any], y: float) -> dict[str, Any]
     return out
 
 
+_ARTICLES = re.compile(r"\b(a|an|the)\b")
+_PUNCTUATION = frozenset(string.punctuation)
+
+
+def squad_normalize(text: str) -> str:
+    """SQuAD's official answer normalizer: lowercase, drop punctuation and articles, collapse spaces."""
+    text = "".join(ch for ch in text.lower() if ch not in _PUNCTUATION)
+    return " ".join(_ARTICLES.sub(" ", text).split())
+
+
+def relaxed_correct(field_spec: Mapping[str, Any], gold: Mapping[str, Any], strict: bool, pred: Mapping[str, Any] | None) -> bool:
+    """``field_correct`` except text values compare after ``squad_normalize`` (null still an answer)."""
+    if field_spec["type"] != "text" or strict or pred is None:
+        return strict
+    gold_value, pred_value = gold.get("value"), pred.get("value")
+    if gold_value is None or pred_value is None:
+        return strict
+    return squad_normalize(str(gold_value)) == squad_normalize(str(pred_value))
+
+
 def score_predictions(
     examples: Iterable[Mapping[str, Any]],
     preds_by_id: Mapping[str, Mapping[str, Mapping[str, Any]]],
@@ -383,7 +405,8 @@ def score_predictions(
                 "field": name,
                 "type": spec["type"],
                 "gold_kind": gold.get("kind"),
-                "correct": field_correct(spec, gold, pred, ref),
+                "correct": (correct := field_correct(spec, gold, pred, ref)),
+                "correct_relaxed": relaxed_correct(spec, gold, correct, pred),
                 "p_correct": answer_prob_correct(pred),
                 "pred_value": None if pred is None else pred.get("value"),
                 "gold_value": gold_value,

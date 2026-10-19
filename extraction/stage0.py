@@ -18,7 +18,9 @@ from typing import Any
 import numpy as np
 import torch
 
-from . import probe, public_data, scoring, synth
+from . import public_data, scoring, synth
+from . import train as trainer
+from .heads import SpanNullHead
 from .encode import SPAN_TYPES
 
 
@@ -99,33 +101,40 @@ def print_table(table: list[dict[str, Any]], suites: list[str]) -> None:
             )
 
 
+def load(model_id: str, dry_run: bool) -> trainer.Backbone:
+    """The real backbone on CUDA, or (dry run) a tiny random one on CPU with the real tokenizer."""
+    if dry_run:
+        return trainer.tiny_backbone(model_id)
+    backbone = trainer.load_backbone(model_id, device="cuda", dtype=torch.bfloat16)
+    print(f"GPU memory after load: {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
+    return backbone
+
+
 def run(config: Stage0Config) -> dict[str, Any]:
     out = Path(config.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     (out / "config.json").write_text(json.dumps(asdict(config), indent=1))
     train, suites = build_data(config)
 
-    if config.dry_run:
-        backbone = probe.tiny_backbone(config.model_id)
-    else:
-        backbone = probe.load_backbone(config.model_id, device="cuda", dtype=torch.bfloat16)
-        print(f"GPU memory after load: {torch.cuda.memory_allocated() / 2**30:.1f} GiB", flush=True)
+    backbone = load(config.model_id, config.dry_run)
     layers = config.layers or list(range(1, backbone.num_layers + 1))
     full_attention = {i + 1 for i, t in enumerate(backbone.layer_types) if t == "full_attention"}
     print(f"{backbone.num_layers} layers; full attention after layers {sorted(full_attention)}", flush=True)
-    probe_config = probe.ProbeConfig(layers=layers, epochs=config.epochs, max_tokens=4096 if config.dry_run else config.max_tokens)
+    train_config = trainer.TrainConfig(epochs=config.epochs, max_tokens=4096 if config.dry_run else config.max_tokens)
 
+    torch.manual_seed(0)
+    heads = {f"L{layer}": SpanNullHead(layer, backbone.hidden_size).to(backbone.device) for layer in layers}
     started = time.perf_counter()
-    result = probe.train_probes(backbone, train, probe_config)
+    result = trainer.train_heads(backbone, heads, train, train_config)
     print(f"training: {time.perf_counter() - started:.0f}s", flush=True)
-    probe.save_heads(result, out / "heads")
+    trainer.save_heads(result, out / "heads")
 
     table, rows_by = [], {}
     for suite, examples in suites.items():
         started = time.perf_counter()
-        predictions = probe.predict(backbone, result.heads, examples, probe_config)
+        predictions = trainer.predict(backbone, result.heads, examples, train_config)
         for layer in layers:
-            rows = span_rows(scoring.score_predictions(examples, predictions[layer]))
+            rows = span_rows(scoring.score_predictions(examples, predictions[f"L{layer}"]))
             rows_by[(suite, layer)] = rows
             table.append(layer_row(suite, layer, "full" if layer in full_attention else "linear", rows))
         print(f"eval {suite}: {time.perf_counter() - started:.0f}s", flush=True)

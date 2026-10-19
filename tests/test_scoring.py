@@ -285,3 +285,16 @@ def test_quantile_normalization():
     assert ans["eta"]["quantiles"] == q and "percentiles" not in ans["eta"]
     with pytest.raises(clairic.ClairicError):
         clairic.normalize_quantiles([1.0, 2.0])
+
+
+def test_relaxed_text_match_follows_squad_normalization():
+    from extraction.scoring import relaxed_correct, squad_normalize
+    spec = {"type": "text"}
+    assert squad_normalize("The  most cost-efficient bidder.") == "most costefficient bidder"
+    gold = {"value": "a quantity surveyor", "kind": "extract"}
+    assert relaxed_correct(spec, gold, False, {"value": "Quantity surveyor."})
+    assert not relaxed_correct(spec, gold, False, {"value": "surveyor"})
+    # null stays an answer: relaxed never turns a wrong null into a right one
+    assert not relaxed_correct(spec, gold, False, {"value": None})
+    # non-text types keep strict correctness
+    assert not relaxed_correct({"type": "number"}, {"value": 5.0}, False, {"value": "5.0."})
