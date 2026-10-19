@@ -4,6 +4,9 @@ A single-pass typed extraction model in the style of Cloudflare's Clairic (`@cf/
 built by fine-tuning an open backbone (Qwen3.5-4B), plus a harness that scores it and Clairic on the
 same requests.
 
+Goals, stage gates, the evaluation protocol against Clairic and the decision log live in
+[`docs/RESEARCH_PLAN.md`](docs/RESEARCH_PLAN.md).
+
 One forward pass reads the request: the document first, then one block per schema field. Small heads
 read the backbone's hidden states and return Clairic-shaped answers (`value`, `span`, `p_null`,
 `confidence`, ...), so `extraction.scoring` treats both models identically.
