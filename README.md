@@ -47,11 +47,10 @@ the real tokenizer and small data. It exercises every cell in about 20 s.
 
 ## Stage 0 on Colab
 
-1. The repo is private (`github.com/pherber3/extraction-model`). In Colab, open the Secrets panel, add
-   `GITHUB_TOKEN` (a token with read access to this repo) and enable notebook access; the setup cell
-   clones with it.
-2. Open the notebook in Colab, choose an A100 runtime, Run all. The setup cell installs
-   `transformers>=5.20`, `datasets` and `flash-linear-attention` with pip (Colab is not a uv environment).
+1. Open `notebooks/stage0_probe_colab.ipynb` from `github.com/pherber3/extraction-model` in Colab
+   (File → Open notebook → GitHub); the setup cell clones the repo.
+2. Choose an A100 runtime, Run all. The setup cell installs `transformers>=5.20`, `datasets` and
+   `flash-linear-attention` with pip (Colab is not a uv environment).
 3. Results land in `/content/stage0_results` (a per-layer table, the best layer's per-field rows and the
    probe weights) and are downloaded as a zip; `USE_DRIVE = True` also copies them to Drive.
 
