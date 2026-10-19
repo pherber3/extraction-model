@@ -54,8 +54,9 @@ the real tokenizer and small data. It exercises every cell in about 20 s.
    (File → Open notebook → GitHub); the setup cell clones the repo.
 2. Choose an A100 runtime, Run all. The setup cell installs `transformers>=5.20`, `datasets` and
    `flash-linear-attention` with pip (Colab is not a uv environment).
-3. Results land in `/content/stage0_results` (a per-layer table, the best layer's per-field rows and the
-   probe weights) and are downloaded as a zip; `USE_DRIVE = True` also copies them to Drive.
+3. Results land in `/content/stage0_results` (a per-layer table, the best layer's per-field rows, the
+   train log and the probe weights) and are downloaded as a zip; the weights (~1 GB) are only included
+   with `INCLUDE_HEADS = True`.
 
 What it measures: for each of the 32 layers, span accuracy and null detection on four held-out suites:
 synthetic documents from templates never seen in training, SQuAD 2.0 dev, Gretel test and FDA.
