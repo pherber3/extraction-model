@@ -5,9 +5,11 @@
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")  # before torch is imported
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from extraction.stage0 import Stage0Config, run  # noqa: E402
@@ -23,6 +25,7 @@ def main() -> None:
     parser.add_argument("--n-gretel", type=int, default=defaults.n_gretel)
     parser.add_argument("--n-eval", type=int, default=defaults.n_eval)
     parser.add_argument("--epochs", type=int, default=defaults.epochs)
+    parser.add_argument("--max-tokens", type=int, default=defaults.max_tokens)
     parser.add_argument("--layers", type=int, nargs="*", help="1-based layer indices (default: all)")
     parser.add_argument("--out", default=defaults.out_dir)
     args = parser.parse_args()
@@ -35,6 +38,7 @@ def main() -> None:
             n_gretel=args.n_gretel,
             n_eval=args.n_eval,
             epochs=args.epochs,
+            max_tokens=args.max_tokens,
             layers=args.layers or None,
             out_dir=args.out,
         )

@@ -31,6 +31,7 @@ class Stage0Config:
     n_gretel: int = 2000  # Gretel synthetic finance train docs
     n_eval: int = 400  # docs per eval suite
     epochs: int = 2
+    max_tokens: int = 8192  # padded tokens per batch; 16384 ran out of memory on a 40 GB A100
     layers: list[int] | None = None  # 1-based; None = all
     out_dir: str = "results/stage0"
 
@@ -112,7 +113,7 @@ def run(config: Stage0Config) -> dict[str, Any]:
     layers = config.layers or list(range(1, backbone.num_layers + 1))
     full_attention = {i + 1 for i, t in enumerate(backbone.layer_types) if t == "full_attention"}
     print(f"{backbone.num_layers} layers; full attention after layers {sorted(full_attention)}", flush=True)
-    probe_config = probe.ProbeConfig(layers=layers, epochs=config.epochs, max_tokens=4096 if config.dry_run else 16384)
+    probe_config = probe.ProbeConfig(layers=layers, epochs=config.epochs, max_tokens=4096 if config.dry_run else config.max_tokens)
 
     started = time.perf_counter()
     result = probe.train_probes(backbone, train, probe_config)

@@ -92,7 +92,8 @@ quantiles`), so one scorer handles both models.
 
 ## Infrastructure
 
-- Training/eval on Colab A100 80 GB (~6.8 compute units/hour). Preferred: the Colab CLI from this machine
+- Training/eval on a Colab A100 (~6.8 compute units/hour). `colab new --gpu A100` gives the **40 GB** card
+  (stage 0 OOM'd at 16k padded tokens per batch; 8k uses ~23 GB). Preferred: the Colab CLI from this machine
   via `scripts/colab.py` (Windows shim, uvx Python 3.13, `--auth=adc`), uploading a zip of the local working
   tree, so runs do not need a push. Browser fallback: the notebook clones `github.com/pherber3/extraction-model`.
 - Never push to GitHub, and never create or stop a billable Colab session, without the user's go-ahead.
