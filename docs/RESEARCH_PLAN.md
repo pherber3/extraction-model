@@ -92,8 +92,9 @@ quantiles`), so one scorer handles both models.
 
 ## Infrastructure
 
-- Training/eval on a Colab A100 (~6.8 compute units/hour). `colab new --gpu A100` gives the **40 GB** card
-  (stage 0 OOM'd at 16k padded tokens per batch; 8k uses ~23 GB). Preferred: the Colab CLI from this machine
+- Training/eval on a Colab A100 (~6.8 compute units/hour). Use `colab new --gpu A100 --high-mem`: the
+  High-RAM shape comes with the **80 GB** A100 (user-observed); without it the CLI gave a 40 GB card, where
+  stage 0 OOM'd at 16k padded tokens per batch (8k uses ~23 GB). Preferred: the Colab CLI from this machine
   via `scripts/colab.py` (Windows shim, uvx Python 3.13, `--auth=adc`), uploading a zip of the local working
   tree, so runs do not need a push. Browser fallback: the notebook clones `github.com/pherber3/extraction-model`.
 - Never push to GitHub, and never create or stop a billable Colab session, without the user's go-ahead.
@@ -111,7 +112,30 @@ quantiles`), so one scorer handles both models.
 ## Status
 
 - 2026-10-19: stage 0 code complete and verified on CPU (64 tests; notebook DRY_RUN end to end; probes
-  overfit 60 docs from 0 to ~57% on a random tiny backbone). First real stage-0 run started on Colab A100.
+  overfit 60 docs from 0 to ~57% on a random tiny backbone).
+- 2026-10-19: **stage 0 done** on a Colab A100 40 GB (Qwen3.5-4B frozen, 32 probes, 7,230 train docs /
+  43,891 fields, 2 epochs, 904 steps at ~0.7 s/step, 687 s training, ~100 s eval). Raw outputs in
+  `results/stage0_a100/` (gitignored). Best layer by mean accuracy: **19** (linear attention); layers 18-20
+  within ~0.02 everywhere; accuracy rises to layer ~19 and declines after.
+
+  | Suite (n fields) | Acc (null counted) | Extract EM | Extract token F1 | Null acc@0.5 | Null Brier | ECE |
+  |---|---|---|---|---|---|---|
+  | Synthetic, unseen templates (2,019) | 0.895 | 0.889 | 0.909 | 0.956 | 0.036 | 0.056 |
+  | SQuAD 2.0 dev (3,940) | 0.630 | 0.359 | 0.566 | 0.936 | 0.049 | 0.035 |
+  | Gretel test (1,793) | 0.858 | 0.816 | 0.868 | 0.944 | 0.044 | 0.037 |
+  | FDA (1,102, no nulls) | 0.415 | 0.415 | 0.599 | — | — | 0.195 |
+
+  Readings: (1) a frozen 4B base already locates typed values in document-like text well (synthetic 89%
+  EM on unseen layouts; numbers 95%, dates 91%, text 85%) and detects absent fields at ~94-96%.
+  (2) Most remaining extract errors are span **boundaries**, not wrong locations (SQuAD: 903 of 1,267
+  wrong answers overlap the gold; FDA 455 of 645; FDA predictions run on into the next key). Our EM is
+  stricter than SQuAD's official normalizer (articles/punctuation), so SQuAD EM is understated.
+  (3) Full- vs linear-attention layer outputs show no systematic difference (means within 0.02 per suite);
+  layer outputs mix both mechanisms, so this does not test the linear-attention risk. FDA (long documents)
+  is the weakest suite; not yet attributable to linear attention.
+
+  Gate: passed. Stage 1 reads layers ~16-20 (learned mix), with a stronger end-boundary head
+  (end conditioned on start), and adds SQuAD-normalized EM as a secondary metric.
 
 ## Decision log
 
